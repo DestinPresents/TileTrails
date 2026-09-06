@@ -1,0 +1,322 @@
+const $=s=>document.querySelector(s);
+const icons=["🍓","🌸","🍄","🎈","🍊","🍧","🍉","🥝","🌺","🍋","🍀","🧁","💎","👑","🧿","🌙","⭐","🦋","🐚","🌈","🍒","🫐","🥥","🌻","🌷","🍀","🪷","🍭","🧸","🎁","☀️","🪄","🦄","🐝","🍪","🫧","🌟","🍑","🍇","🥭"];
+const screens={home:$("#home"),map:$("#map"),game:$("#game")};
+function numStore(key, fallback, min=0, max=999999){
+  const n=Number(localStorage.getItem(key));
+  return Number.isFinite(n)?Math.min(max,Math.max(min,n)):fallback;
+}
+function loadPowerups(){
+  try{
+    const p=JSON.parse(localStorage.getItem("tt_pu")||"{}");
+    return {undo:numStoreFrom(p.undo,3),shuffle:numStoreFrom(p.shuffle,3),hint:numStoreFrom(p.hint,3)};
+  }catch{return {undo:3,shuffle:3,hint:3};}
+}
+function numStoreFrom(v,f){const n=Number(v);return Number.isFinite(n)&&n>=0?Math.floor(n):f;}
+const MAX_LEVEL=3000;
+const GAME_NAME="Tile Trails";
+const DEVELOPER="Destin Studios";
+const state={
+ level:numStore("tt_level",21,1,MAX_LEVEL),
+ coins:numStore("tt_coins",340,0,999999999),
+ streak:numStore("tt_streak",3,0,9999),
+ lastDaily:localStorage.getItem("tt_daily")||"",
+ pu:loadPowerups(),
+ sound:localStorage.getItem("tt_sound")!=="0",
+ music:localStorage.getItem("tt_music")!=="0"
+};
+let board=[],tray=[],history=[],matched=0,target=36,time=60,timerId=null,levelSeed=0,pickBusy=false,gameOver=false,pendingPickTimer=null,matchTimer=null;
+let traySpecial=[];
+let audioCtx=null,musicTimer=null,comboCount=0,matchEpoch=0;
+function save(){localStorage.setItem("tt_level",state.level);localStorage.setItem("tt_coins",state.coins);localStorage.setItem("tt_streak",state.streak);localStorage.setItem("tt_daily",state.lastDaily);localStorage.setItem("tt_pu",JSON.stringify(state.pu));localStorage.setItem("tt_sound",state.sound?"1":"0");localStorage.setItem("tt_music",state.music?"1":"0");localStorage.setItem("tt_extra_slot",state.extraSlot?"1":"0")}
+function show(n){Object.values(screens).forEach(x=>x.classList.remove("active"));screens[n].classList.add("active")}
+function todayKey(){return new Date().toISOString().slice(0,10)}
+function dailyAvailable(){return state.lastDaily!==todayKey()}
+function updateCoins(){ $("#coinCount").textContent=state.coins.toLocaleString();$("#homeLevel").textContent=state.level;$("#playLevel").textContent=state.level;$("#gameLevel").textContent=state.level;$("#streakText").textContent=state.streak+" days"; const a=dailyAvailable();$("#dailyBtn").textContent=a?"🪙 CLAIM":"✓ CLAIMED";$("#dailyBtn").disabled=!a;$("#dailyBtn").classList.toggle("claimed",!a);}
+function claimDaily(){if(!dailyAvailable())return;
+  const last=state.lastDaily; const now=todayKey();
+  if(last){const a=new Date(last),b=new Date(now);const days=Math.round((b-a)/86400000);state.streak=days===1?state.streak+1:1;}else state.streak=1;
+  const reward=50;state.coins+=reward;state.lastDaily=now;save();updateCoins();
+  modal(`<div class="reward-icon">🪙</div><h2>Daily Reward</h2><p>Today's reward has been added to your wallet.</p><div class="big-reward">+50 Coins</div><button class="modal-action" onclick="closeModal()">AWESOME!</button>`)}
+function applyTheme(level){
+  const themes=[
+    [1,"tropical","🌴 TROPICAL ISLAND"],[101,"lagoon","🌊 BLUE LAGOON"],[201,"garden","🌺 FLOWER GARDEN"],[301,"forest","🌲 MYSTIC FOREST"],[401,"snow","❄️ SNOW VALLEY"],[501,"fantasy","✨ FANTASY REALM"]
+  ];
+  let theme=themes[0]; for(const t of themes)if(level>=t[0])theme=t;
+  $("#app").dataset.theme=theme[1];
+  const el=$(".game-level"); if(el)el.dataset.themeName=theme[2];
+}
+function buildPreview(){const p=$("#previewGrid");p.innerHTML="";icons.slice((state.level*3)%icons.length,(state.level*3)%icons.length+12).forEach(x=>{const d=document.createElement("div");d.textContent=x;p.appendChild(d)})}
+function buildMap(){const m=$("#mapPath");m.innerHTML="";const frag=document.createDocumentFragment();for(let n=1;n<=MAX_LEVEL;n++){const b=document.createElement("button");b.className="map-node "+(n<state.level?"done ":"")+(n===state.level?"current ":"")+(n>state.level?"locked":"");b.textContent=n>state.level?"🔒 "+n:(n<state.level?"✓ "+n:n);if(n<=state.level)b.onclick=()=>startLevel(n);frag.appendChild(b)}m.appendChild(frag)}
+function levelTarget(level){if(level<=25)return 15;if(level<=50)return 18;if(level<=75)return 21;if(level<=100)return 24;return Math.min(180,24+Math.floor((level-100)/40)*6)}
+function levelTime(level){if(level<100)return 90;if(level<200)return 120;if(level<500)return 150;if(level<1000)return 180;return 240}
+function winReward(level){return 100+Math.floor((Math.max(1,level)-1)/50)*10}
+function trayCapacity(){return state.extraSlot?7:6}
+function startLevel(level=state.level){state.level=Math.min(MAX_LEVEL,Math.max(1,Number(level)||1));save();clearInterval(timerId);stopMusic();matchEpoch++;gameOver=false;pickBusy=false;show("game");applyTheme(state.level);levelSeed=state.level;target=levelTarget(state.level);matched=0;tray=[];traySpecial=[];history=[];time=levelTime(state.level);comboCount=0;$("#target").textContent=target;$("#matched").textContent=0;$("#time").textContent=time;$("#progress").style.width="0%";updatePowerups();generateSolvableLevel();renderTray();startMusic();clearInterval(timerId);timerId=setInterval(()=>{time--;$("#time").textContent=time;if(time<=0){clearInterval(timerId);lose("⏰ Time's Up!")}},1000)}
+function shuffle(a){return a.sort(()=>Math.random()-.5)}
+function generateSolvableLevel(){
+  const el=$("#board"); el.innerHTML=""; board=[];
+  const w=Math.max(280,el.clientWidth||390), h=Math.max(320,el.clientHeight||420);
+  const groups=Math.ceil(target/3), tileW=57, tileH=57, rand=()=>Math.random();
+  const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
+  // Early levels intentionally use a light, readable pile. As levels rise,
+  // spacing tightens and the pile gains more depth/overlap.
+  const density=state.level<=50?0.82:state.level<=100?0.9:state.level<=200?0.96:1.02;
+  const stepX=Math.max(48,Math.round(57*density));
+  const stepY=Math.max(46,Math.round(57*density));
+  const cols=Math.max(4,Math.floor((w-22)/stepX));
+  const rows=Math.max(5,Math.floor((h-22)/stepY));
+  const cx=w/2,cy=h/2, positions=[];
+  for(let r=0;r<rows;r++) for(let c=0;c<cols;c++){
+    const baseX=8+c*stepX+(r%2?stepX*.48:0);
+    const baseY=7+r*stepY;
+    const radial=Math.min(1,Math.hypot(baseX-cx,baseY-cy)/(Math.max(w,h)*.72));
+    const spread=1+radial*(state.level>100?.18:.08);
+    const jitter=state.level<=50?7:state.level<=100?10:15;
+    positions.push({x:clamp(cx+(baseX-cx)*spread+(rand()-.5)*jitter,2,w-tileW-2),y:clamp(cy+(baseY-cy)*spread+(rand()-.5)*jitter,2,h-tileH-2)});
+  }
+  shuffle(positions);
+  const all=[];
+  for(let g=0;g<groups;g++){
+    const icon=icons[Math.floor(rand()*icons.length)];
+    for(let k=0;k<3;k++){
+      const base=positions[(g*3+k)%positions.length];
+      const spread=state.level<=50?9:state.level<=100?15:26;
+      const q={x:clamp(base.x+(rand()-.5)*spread,2,w-tileW-2),y:clamp(base.y+(rand()-.5)*spread,2,h-tileH-2)};
+      all.push({id:all.length,icon,x:q.x,y:q.y,z:0,group:g,removed:false,special:(state.level>=200&&k===0&&g%7===0)?'gold':null});
+    }
+  }
+  shuffle(all);
+  all.forEach((t,i)=>{t.z=i+1;t.layer=Math.floor(i/Math.max(1,Math.ceil(all.length/(state.level<=50?3:state.level<=100?4:5))))});
+  board=all; renderBoard(); renderTray();
+}
+function overlaps(a,b){return Math.abs(a.x-b.x)<48&&Math.abs(a.y-b.y)<48}
+function isBlocked(t){return board.some(o=>!o.removed&&o.id!==t.id&&o.z>t.z&&overlaps(t,o))}
+function renderBoard(){const el=$("#board");el.querySelectorAll(".tile").forEach(x=>x.remove());board.filter(t=>!t.removed).forEach(t=>{const b=document.createElement("button");b.className="tile";b.dataset.id=t.id;b.style.left=t.x+"px";b.style.top=t.y+"px";b.style.setProperty("--z",t.z);b.style.zIndex=t.z; b.style.setProperty("--dx",((t.id*17)%7-3)+"px");if(isBlocked(t))b.classList.add("blocked");else b.setAttribute("aria-label","Select "+t.icon);if(t.special)b.classList.add("special-"+t.special);b.textContent=t.icon;el.appendChild(b)})}
+function record(){history.push({board:board.map(t=>({...t})),tray:[...tray],traySpecial:[...traySpecial],matched})}
+function playSound(type="click"){
+  if(!state.sound)return;
+  try{
+    audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
+    if(audioCtx.state==='suspended')audioCtx.resume();
+    const now=audioCtx.currentTime;
+    const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.connect(g);g.connect(audioCtx.destination);
+    const cfg={click:[580,.11,'sine',.24],match:[760,.18,'triangle',.34],match2:[1120,.24,'sine',.28],buy:[650,.14,'sine',.22],win:[680,.26,'triangle',.28],lose:[170,.30,'sawtooth',.20]}[type]||[560,.12,'sine',.22];
+    o.type=cfg[2];o.frequency.setValueAtTime(cfg[0],now);
+    if(type==='match'||type==='win')o.frequency.exponentialRampToValueAtTime(cfg[0]*1.42,now+cfg[1]);
+    g.gain.setValueAtTime(cfg[3],now);g.gain.exponentialRampToValueAtTime(.001,now+cfg[1]);
+    o.start(now);o.stop(now+cfg[1]+.03);
+    if(type==='match'){setTimeout(()=>playSound('match2'),90)}
+  }catch{}
+}
+function startMusic(){
+  if(!state.music||!state.sound||musicTimer)return;
+  const notes=[261.63,329.63,392,523.25,392,329.63]; let i=0;
+  const tick=()=>{if(!state.music||!state.sound)return;try{audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();if(audioCtx.state==='suspended')audioCtx.resume();const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.type='sine';o.frequency.value=notes[i++%notes.length];g.gain.value=.022;o.connect(g);g.connect(audioCtx.destination);const n=audioCtx.currentTime;g.gain.exponentialRampToValueAtTime(.001,n+.35);o.start(n);o.stop(n+.38)}catch{}};
+  tick(); musicTimer=setInterval(tick,900);
+}
+function stopMusic(){clearInterval(musicTimer);musicTimer=null}
+function vibrate(pattern=[18]){if(navigator.vibrate)try{navigator.vibrate(pattern)}catch{}}
+function showToast(text,kind='good'){
+  const old=document.querySelector('.game-toast');if(old)old.remove();
+  const d=document.createElement('div');d.className='game-toast '+kind;d.textContent=text;
+  document.body.appendChild(d);requestAnimationFrame(()=>d.classList.add('show'));
+  setTimeout(()=>{d.classList.remove('show');setTimeout(()=>d.remove(),220)},900);
+}
+function flyToTray(tileEl){
+  const slot=document.querySelector(`#tray .slot:not(.locked-slot):nth-child(${Math.min(7,tray.length)})`)||document.querySelector('#tray .slot:not(.locked-slot)');
+  if(!tileEl||!slot)return;
+  const a=tileEl.getBoundingClientRect(),b=slot.getBoundingClientRect();
+  const c=tileEl.cloneNode(true);c.className='tile-fly';c.textContent=tileEl.textContent;
+  c.style.left=a.left+'px';c.style.top=a.top+'px';c.style.width=a.width+'px';c.style.height=a.height+'px';
+  document.body.appendChild(c);
+  requestAnimationFrame(()=>{c.style.transform=`translate(${b.left-a.left+b.width*.1}px,${b.top-a.top}px) scale(.62) rotate(8deg)`;c.style.opacity='0.2'});
+  setTimeout(()=>c.remove(),360);
+}
+function pick(id){
+  if(gameOver||pickBusy)return;
+  const t=board.find(x=>x.id===id);
+  if(!t||t.removed||isBlocked(t))return;
+  if(tray.length>=trayCapacity()){gameOver=true;clearInterval(timerId);lose("💥 Tray Full!");return;}
+  pickBusy=true; record(); const myEpoch=matchEpoch;
+  const source=document.querySelector(`[data-id="${id}"]`);
+  t.removed=true; tray.push(t.icon); traySpecial.push(!!t.special);
+  playSound('click'); vibrate([12]); flyToTray(source);
+  if(source)source.classList.add('pop');
+  clearTimeout(pendingPickTimer);
+  pendingPickTimer=setTimeout(()=>{
+    pendingPickTimer=null;
+    const groupsToClear=[];
+    for(const icon of [...new Set(tray)]){
+      const inds=tray.map((x,i)=>x===icon?i:-1).filter(i=>i>=0);
+      if(inds.length>=3)groupsToClear.push({icon,inds:inds.slice(0,3)});
+    }
+    if(groupsToClear.length){
+      renderTray();
+      groupsToClear.forEach((m,idx)=>{
+        const slots=m.inds;
+        slots.forEach(i=>{const el=document.querySelector(`#tray .slot:nth-child(${i+1})`);if(el)el.classList.add('match-burst')});
+        setTimeout(()=>{
+          if(myEpoch!==matchEpoch||gameOver)return;
+          const goldBonus=m.inds.some(i=>traySpecial[i])?15:0;
+          tray=tray.filter((_,i)=>!slots.includes(i));
+          traySpecial=traySpecial.filter((_,i)=>!slots.includes(i));
+          matched+=3;state.coins+=3+goldBonus;comboCount++;save();
+          const comboWord=goldBonus?`GOLDEN +${goldBonus}!`:comboCount>=4?'PERFECT COMBO!':comboCount===3?'BRILLIANT!':comboCount===2?'AMAZING!':'EXCELLENT!';
+          showToast(comboWord,'good');
+          playSound('match');vibrate([22,30,22]);
+          renderTray();renderBoard();updateProgress();
+          if(matched>=target){gameOver=true;clearInterval(timerId);win()}
+        },420+idx*80);
+      });
+      matchTimer=setTimeout(()=>{pickBusy=false;},520+groupsToClear.length*80);
+    }else{
+      save();renderTray();renderBoard();updateProgress();pickBusy=false;
+      if(tray.length>=trayCapacity()){gameOver=true;clearInterval(timerId);lose('💥 Tray Full!')}
+    }
+  },140);
+}
+function renderTray(){
+  const t=$("#tray");t.innerHTML="";
+  for(let i=0;i<7;i++){
+    const s=document.createElement("div");
+    if(i===6&&!state.extraSlot){
+      s.className="slot locked-slot";
+      s.innerHTML='<span class="slot-plus">＋</span><small>30</small>';
+      s.title="Buy extra slot for 30 coins";
+      s.onclick=buyExtraSlot;
+    }else{
+      s.className="slot"+(tray[i]?" filled":"");s.textContent=tray[i]||"";
+    }
+    t.appendChild(s);
+  }
+}
+function updateProgress(){$("#matched").textContent=matched;$("#progress").style.width=Math.min(100,matched/target*100)+"%";updatePowerups();updateCoins()}
+function updatePowerups(){const prices={undo:50,shuffle:100,hint:50};["undo","shuffle","hint"].forEach(k=>{const b=$("#"+k),c=b.querySelector("b"),s=b.querySelector("small");if(state.pu[k]>0){c.textContent=state.pu[k];s.textContent=k.toUpperCase();b.classList.remove("buy-mode")}else{c.textContent="🪙"+prices[k];s.textContent="BUY";b.classList.add("buy-mode")}})}
+function starRating(){
+  const trayPenalty=Math.max(0,tray.length-2);
+  const timeRatio=time/Math.max(1,levelTime(state.level));
+  if(timeRatio>.55&&trayPenalty<=1)return 3;
+  if(timeRatio>.25)return 2;
+  return 1;
+}
+function milestoneBonus(level){
+  if(level%100===0)return 500;
+  if(level%50===0)return 250;
+  if(level%25===0)return 150;
+  return 0;
+}
+function chestBonus(level){return level%10===0?100+Math.floor(level/100)*25:0}
+function redeemCode(){
+  const input=$("#redeemInput"); if(!input)return;
+  const code=input.value.trim().toLowerCase();
+  const rewards={"adi7s":100000,"somu34":3400};
+  const used=JSON.parse(localStorage.getItem("tt_redeemed")||"{}");
+  if(!rewards[code]){showToast("INVALID CODE","bad");return;}
+  if(used[code]){showToast("CODE ALREADY USED","bad");return;}
+  state.coins+=rewards[code];used[code]=1;localStorage.setItem("tt_redeemed",JSON.stringify(used));save();updateCoins();playSound("buy");vibrate([20,30,20]);
+  showToast("+"+rewards[code].toLocaleString()+" COINS","buy");
+  input.value="";
+}
+function howToPlay(){modal(`<div class="settings-head"><div class="settings-icon">❓</div><div><div class="eyebrow">QUICK GUIDE</div><h2>HOW TO PLAY</h2></div></div><div class="howto-list"><div>1️⃣ Tap an uncovered tile.</div><div>2️⃣ Collect 3 identical tiles.</div><div>3️⃣ Three matching tiles disappear.</div><div>4️⃣ Keep the tray from filling.</div><div>5️⃣ Use Undo, Shuffle and Hint wisely.</div></div><button class="modal-action" onclick="closeModal()">GOT IT!</button>`)}
+function levelIntro(level){
+  modal(`<div class="level-intro"><div class="intro-badge">LEVEL ${level}</div><h2>Ready to Explore?</h2><p>🧩 ${target} tiles &nbsp; • &nbsp; ⏱️ ${time}s</p><button class="modal-action" onclick="closeModal();playSound('click');vibrate([18])">PLAY NOW <span>▶</span></button></div>`);
+}
+function win(){
+  stopMusic(); gameOver=true;clearInterval(timerId);playSound('win');vibrate([35,45,70]);
+  const completed=state.level;
+  const baseReward=winReward(completed);
+  const milestone=milestoneBonus(completed);
+  const chest=chestBonus(completed);
+  const reward=baseReward+milestone+chest;
+  const stars=starRating();
+  state.coins+=reward;
+  const next=Math.min(MAX_LEVEL,completed+1);
+  if(completed<MAX_LEVEL)state.level=next;
+  save();updateCoins();buildMap();
+  const chestHtml=chest?`<div class="chest-reward">🎁 Treasure Chest +${chest}</div>`:'';
+  const milestoneHtml=milestone?`<div class="milestone-reward">🏅 Milestone Bonus +${milestone}</div>`:'';
+  const nextButton=completed<MAX_LEVEL?`<button class="modal-action" onclick="closeModal();startLevel(${next})">NEXT LEVEL <span>→</span></button>`:`<button class="modal-action" onclick="closeModal();show('home')">FINISH <span>✓</span></button>`;
+  modal(`<div class="result-burst win-burst">🏆</div><div class="result-label">LEVEL CLEARED</div><h2>Brilliant!</h2><div class="stars">${'★'.repeat(stars)}${'☆'.repeat(3-stars)}</div><p>Great matching. Your reward is ready.</p><div class="big-reward">🪙 +${reward} Coins</div>${chestHtml}${milestoneHtml}<div class="victory-choice">CHOOSE YOUR NEXT STEP</div>${nextButton}<button class="secondary-action" onclick="closeModal();show('home')">⌂ HOME</button>`);
+}
+function lose(title){
+  stopMusic(); gameOver=true;clearInterval(timerId);playSound('lose');vibrate([80,40,80]);
+  modal(`<div class="result-burst lose-burst">💫</div><div class="result-label">RUN ENDED</div><h2>${title}</h2><p>One more smart attempt and you can clear it.</p><button class="modal-action" onclick="closeModal();startLevel(state.level)">TRY AGAIN</button><button class="secondary-action" onclick="closeModal();show('home')">⌂ HOME</button>`);
+}
+function modal(html){$("#modalBody").innerHTML=html;$("#modal").classList.remove("hidden")}
+function closeModal(){$("#modal").classList.add("hidden")}
+function useUndo(){
+  if(!state.pu.undo){buyPowerup("undo",50);return;}
+  if(!history.length)return;
+  clearTimeout(pendingPickTimer);
+  clearTimeout(matchTimer);
+  pendingPickTimer=null;matchTimer=null;
+  pickBusy=false;
+  gameOver=false;
+  state.pu.undo--;playSound("click");vibrate([25]);
+  const h=history.pop();
+  board=h.board.map(t=>({...t}));
+  tray=[...h.tray];
+  traySpecial=[...(h.traySpecial||[])];
+  matched=h.matched;
+  save();
+  renderTray();
+  renderBoard();
+  updateProgress();
+  // Keep the countdown alive after an undo instead of leaving the board in a
+  // locked/intermediate state.
+  clearInterval(timerId);
+  timerId=setInterval(()=>{
+    time--; $("#time").textContent=time;
+    if(time<=0){clearInterval(timerId);lose("⏰ Time's Up!");}
+  },1000);
+}
+function useShuffle(){if(!state.pu.shuffle){buyPowerup("shuffle",100);return}state.pu.shuffle--;const alive=board.filter(t=>!t.removed),positions=alive.map(t=>({x:t.x,y:t.y}));shuffle(positions);alive.forEach((t,i)=>{t.x=positions[i].x;t.y=positions[i].y});save();renderBoard();updatePowerups()}
+function useHint(){if(!state.pu.hint){buyPowerup("hint",50);return}const avail=board.filter(t=>!t.removed&&!isBlocked(t));if(!avail.length)return;const candidate=avail.find(t=>tray.includes(t.icon))||avail[0];state.pu.hint--;const el=document.querySelector(`[data-id="${candidate.id}"]`);if(el){el.classList.add("hint");setTimeout(()=>el.classList.remove("hint"),1300)}save();updatePowerups()}
+function buyExtraSlot(){
+  if(state.extraSlot)return;
+  if(state.coins<30){playSound('lose');vibrate([50]);showToast('NOT ENOUGH COINS','bad');return;}
+  state.coins-=30;state.extraSlot=true;save();updateCoins();renderTray();playSound('buy');vibrate([16,25]);showToast('EXTRA SLOT UNLOCKED','buy');
+}
+function buyPowerup(type,price){
+  if(state.coins<price){playSound('lose');vibrate([50]);showToast('NOT ENOUGH COINS','bad');return;}
+  state.coins-=price;state.pu[type]++;save();updateCoins();updatePowerups();playSound('buy');vibrate([16,25]);showToast(`${type.toUpperCase()} +1`,'buy');
+}
+function openShop(){modal(`<div class="shop-hero"><div class="shop-icon">🛒</div><div><div class="eyebrow">TILE TRAILS</div><h2>SHOP</h2><p>Use coins earned by playing.</p></div></div><div class="wallet"><span>YOUR COINS</span><strong>🪙 ${state.coins.toLocaleString()}</strong></div><div class="shop-title">EXTRA TRAY SLOT</div><div class="extra-slot-card ${state.extraSlot?'unlocked':''}"><div class="extra-slot-icon">＋</div><div><strong>${state.extraSlot?'Extra Slot Unlocked':'7th Slot'}</strong><small>${state.extraSlot?'You can now use all 7 tray spaces.':'Unlock the 7th tray space for easier matches.'}</small></div>${state.extraSlot?'<span class="owned-badge">✓ OWNED</span>':'<button onclick="buyExtraSlot();openShop()">🪙 30</button>'}</div><div class="shop-title">POWER-UPS</div><div class="shop-cards"><div class="shop-card"><div class="shop-card-icon">↩</div><div><strong>Undo</strong><small>Restore your last move</small></div><button onclick="buyPowerup('undo',50)">🪙 50</button></div><div class="shop-card"><div class="shop-card-icon">🔀</div><div><strong>Shuffle</strong><small>Rearrange the board</small></div><button onclick="buyPowerup('shuffle',100)">🪙 100</button></div><div class="shop-card"><div class="shop-card-icon">💡</div><div><strong>Hint</strong><small>Highlight a smart move</small></div><button onclick="buyPowerup('hint',50)">🪙 50</button></div></div><button class="secondary-action full" onclick="closeModal()">CLOSE</button>`)}
+
+function openAbout(){modal(`<div class="settings-head"><div class="settings-icon">✦</div><div><div class="eyebrow">THE TEAM</div><h2>ABOUT US</h2></div></div><div class="about-copy"><h3>${GAME_NAME}</h3><p><b>Tile Trails</b> is a simple, relaxing and challenging tile-matching adventure built for players who love quick puzzles, colorful objects and satisfying triple matches.</p><p>Our goal is to create lightweight games that are easy to understand, fun to replay and enjoyable on both mobile and desktop devices.</p><div class="about-facts"><div><span>DEVELOPER</span><b>${DEVELOPER}</b></div><div><span>GAME</span><b>${GAME_NAME}</b></div><div><span>CO-FOUNDER</span><b>Rudra Pratap Singh</b></div><div><span>STYLE</span><b>Casual • Puzzle • Match 3</b></div></div></div><button class="secondary-action full" onclick="closeModal()">CLOSE</button>`)}
+function openEvents(){
+  modal(`<div class="events-head"><div class="events-icon">🎪</div><div><div class="eyebrow">LIMITED TIME</div><h2>EVENTS</h2></div></div>
+  <div class="event-card"><div class="event-badge">SOON</div><h3>🌸 Flower Festival</h3><p>Special event levels and bonus coins are coming here.</p></div>
+  <div class="event-card"><div class="event-badge">SOON</div><h3>🏆 Explorer Challenge</h3><p>Complete daily challenges and collect exclusive rewards.</p></div>
+  <button class="secondary-action full" onclick="closeModal()">CLOSE</button>`);
+}
+function settings(){modal(`<div class="settings-head"><div class="settings-icon">⚙</div><div><div class="eyebrow">GAME</div><h2>SETTINGS</h2></div></div><div class="setting-row">🔊 Sound <button class="toggle ${state.sound?"":"off"}" id="soundToggle">${state.sound?"ON":"OFF"}</button></div><div class="setting-row">🎵 Music <button class="toggle ${state.music?"":"off"}" id="musicToggle">${state.music?"ON":"OFF"}</button></div><div class="setting-row">❓ How to Play <button class="link-btn" onclick="howToPlay()">VIEW</button></div><div class="setting-row"><span>🔒 Privacy Policy</span><button class="link-btn" onclick="openPrivacy()">VIEW</button></div><div class="setting-row"><span>ℹ About</span><button class="link-btn" onclick="openAbout()">VIEW</button></div><button class="secondary-action full" onclick="closeModal()">DONE</button>`);
+  $("#soundToggle").onclick=()=>{state.sound=!state.sound;save();if(state.sound)startMusic();else stopMusic();settings()};
+  $("#musicToggle").onclick=()=>{state.music=!state.music;save();if(state.music)startMusic();else stopMusic();settings()};
+}
+function openPrivacy(){modal(`<div class="reward-icon">🔒</div><h2>Privacy Policy</h2><p>Your privacy policy page will be connected here later.</p><button class="modal-action" onclick="closeModal()">OK</button>`)}
+function init(){
+  $("#eventBtn").onclick=openEvents;
+  $("#playBtn").onclick=()=>startLevel(state.level);
+  $("#homeMap").onclick=()=>{buildMap();show("map");requestAnimationFrame(()=>$("#mapPath").scrollTop=0)};
+  $("#mapBtn").onclick=()=>{buildMap();show("map");requestAnimationFrame(()=>$("#mapPath").scrollTop=0)};
+  $("#mapHome").onclick=()=>{clearInterval(timerId);show("home");buildPreview();updateCoins()};
+  $("#mapBackTop").onclick=()=>{clearInterval(timerId);show("home");buildPreview();updateCoins()};
+  $("#gameHome").onclick=()=>{clearInterval(timerId);gameOver=true;pickBusy=false;updateCoins();buildPreview();show("home")};
+  $("#homeShop").onclick=openShop;
+  $("#shopTop").onclick=openShop;
+  $("#dailyBtn").onclick=claimDaily;
+  $("#settingsBtn").onclick=settings;
+  $("#closeModal").onclick=closeModal;
+  $("#undo").onclick=useUndo;
+  $("#shuffle").onclick=useShuffle;
+  $("#hint").onclick=useHint;
+  // Event delegation makes tile taps reliable even after the board is re-rendered.
+  $("#board").addEventListener("click",e=>{
+    const tile=e.target.closest(".tile");
+    if(tile) pick(Number(tile.dataset.id));
+  });
+  updateCoins(); buildPreview(); buildMap(); updatePowerups();
+}
+window.addEventListener("error",e=>console.error("Tile Trails error:",e.error||e.message));
+if(document.readyState==="loading") document.addEventListener("DOMContentLoaded",init,{once:true}); else init();
